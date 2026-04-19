@@ -20,8 +20,10 @@ def extract_cost(message: object) -> float:
     if usage is None:
         return 0.0
 
-    input_tokens = getattr(usage, "input_tokens", None)
-    output_tokens = getattr(usage, "output_tokens", None)
+    if not isinstance(usage, dict):
+        return 0.0
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
     if input_tokens is None or output_tokens is None:
         return 0.0
 

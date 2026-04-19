@@ -5,11 +5,12 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from claude_agent_sdk import query, ClaudeAgentOptions, HookMatcher
+    from claude_agent_sdk import query, ClaudeAgentOptions, HookMatcher, TextBlock
 except ImportError:  # pragma: no cover
     query = None  # type: ignore[assignment]
     ClaudeAgentOptions = None  # type: ignore[assignment]
     HookMatcher = None  # type: ignore[assignment]
+    TextBlock = None  # type: ignore[assignment]
 
 from vibranium.config import VibraniumConfig
 from vibranium.cost_tracker import extract_cost
@@ -51,7 +52,7 @@ async def run_executor(
 
     # Step 5: Stream query and accumulate cost
     total_cost: float = 0.0
-    async for msg in query(prompt, options):
+    async for msg in query(prompt=prompt, options=options):
         cost = extract_cost(msg)
         total_cost += cost
         if getattr(msg, "tool_use", None):
@@ -85,11 +86,12 @@ async def run_evaluator(
     # Step 4: Stream query and accumulate
     total_cost: float = 0.0
     full_response: str = ""
-    async for msg in query(prompt, options):
+    async for msg in query(prompt=prompt, options=options):
         cost = extract_cost(msg)
         total_cost += cost
-        if getattr(msg, "text", None):
-            full_response += msg.text
+        for block in getattr(msg, "content", []):
+            if isinstance(block, TextBlock):
+                full_response += block.text
 
     # Step 5: Parse verdict
     try:
@@ -139,7 +141,7 @@ async def run_fix_executor(
 
     # Step 5: Stream query and accumulate cost
     total_cost: float = 0.0
-    async for msg in query(prompt, options):
+    async for msg in query(prompt=prompt, options=options):
         total_cost += extract_cost(msg)
         if getattr(msg, "tool_use", None):
             logger.info("[%s] fix_executor: %s", item.id, msg.tool_use)
@@ -165,9 +167,10 @@ async def run_refactor_analyzer(
 
     # Step 3: Stream query and accumulate text
     full_response: str = ""
-    async for msg in query(prompt, options):
-        if getattr(msg, "text", None):
-            full_response += msg.text
+    async for msg in query(prompt=prompt, options=options):
+        for block in getattr(msg, "content", []):
+            if isinstance(block, TextBlock):
+                full_response += block.text
 
     # Step 4: Return concatenated text
     return full_response

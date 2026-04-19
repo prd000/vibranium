@@ -30,6 +30,10 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     # Step 3: Resolve paths
     plan_path = Path(args.plan)
+    if not plan_path.exists():
+        fallback = Path(".state") / "plan.md"
+        if fallback.exists():
+            plan_path = fallback
     state_dir = Path(config.paths.state_dir)
 
     # Step 4: Parse plan
@@ -78,6 +82,10 @@ def cmd_resume(args: argparse.Namespace) -> None:
 
     # Step 3: Resolve paths
     plan_path = Path(args.plan)
+    if not plan_path.exists():
+        fallback = Path(".state") / "plan.md"
+        if fallback.exists():
+            plan_path = fallback
     state_dir = Path(config.paths.state_dir)
 
     # Step 4: Parse plan
