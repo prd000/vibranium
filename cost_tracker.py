@@ -4,14 +4,21 @@ from vibranium.models import ProjectProgress
 RATES: dict[str, dict[str, float]] = {
     "claude-opus-4":     {"input": 15.00, "output": 75.00},
     "claude-opus-3-7":   {"input": 3.00,  "output": 15.00},
+    "claude-sonnet-4-6": {"input": 3.00,  "output": 15.00},
     "claude-sonnet-4-5": {"input": 3.00,  "output": 15.00},
     "claude-sonnet-4":   {"input": 3.00,  "output": 15.00},
     "claude-haiku-3-5":  {"input": 0.80,  "output": 4.00},
     "claude-haiku-3":    {"input": 0.25,  "output": 1.25},
-    "opusplan":          {"input": 15.00, "output": 75.00},
     "sonnet":            {"input": 3.00,  "output": 15.00},
     "opus":              {"input": 15.00, "output": 75.00},
 }
+
+
+def _get_token(usage: object, key: str) -> int | None:
+    """Return token count from usage, supporting both dict and object forms."""
+    if isinstance(usage, dict):
+        return usage.get(key)
+    return getattr(usage, key, None)
 
 
 def extract_cost(message: object) -> float:
@@ -20,10 +27,8 @@ def extract_cost(message: object) -> float:
     if usage is None:
         return 0.0
 
-    if not isinstance(usage, dict):
-        return 0.0
-    input_tokens = usage.get("input_tokens")
-    output_tokens = usage.get("output_tokens")
+    input_tokens = _get_token(usage, "input_tokens")
+    output_tokens = _get_token(usage, "output_tokens")
     if input_tokens is None or output_tokens is None:
         return 0.0
 
@@ -42,8 +47,15 @@ def extract_cost(message: object) -> float:
     if best_key is None:
         return 0.0
 
-    rates = RATES[best_key]
-    return (input_tokens * rates["input"] + output_tokens * rates["output"]) / 1_000_000
+    cache_write = _get_token(usage, "cache_creation_input_tokens") or 0
+    cache_read  = _get_token(usage, "cache_read_input_tokens") or 0
+    r = RATES[best_key]
+    return (
+        input_tokens  * r["input"]
+        + output_tokens * r["output"]
+        + cache_write   * r["input"] * 1.25
+        + cache_read    * r["input"] * 0.10
+    ) / 1_000_000
 
 
 def format_cost_table(progress: ProjectProgress) -> str:

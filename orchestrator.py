@@ -1,13 +1,17 @@
 """Asyncio orchestrator that runs executor, evaluator, and fix agents in a concurrent pipeline."""
 import asyncio
 import logging
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from vibranium.agent_runner import run_executor, run_evaluator, run_fix_executor, with_retry
+from vibranium.agent_runner import (
+    run_executor, run_evaluator, run_fix_executor, with_retry,
+    run_refactor_executor, run_refactor_evaluator,
+)
 from vibranium.config import VibraniumConfig
 from vibranium.file_locks import FileLockManager
 from vibranium.models import EvalResult, FlaggedItem, Issue, ItemStatus, PlanItem, ProjectProgress, Verdict
@@ -27,6 +31,7 @@ class Orchestrator:
         state_dir: Path,
         ws: Any,
         sequential: bool = False,
+        refactor_mode: bool = False,
     ) -> None:
         """Store args; initialize all runtime state; load+reconcile progress; ensure dirs; wire ws."""
         self.plan = plan
@@ -34,6 +39,7 @@ class Orchestrator:
         self.state_dir = state_dir
         self.ws = ws
         self.sequential = sequential
+        self.refactor_mode = refactor_mode
         self.eval_queue: asyncio.Queue = asyncio.Queue()
         self.manager: FileLockManager = FileLockManager()
         self.fix_semaphore: asyncio.Semaphore = asyncio.Semaphore(config.limits.max_concurrent_fix_agents)
@@ -75,6 +81,11 @@ class Orchestrator:
             if ip.status == ItemStatus.FLAGGED:
                 continue
 
+            # Executor already ran but evaluator didn't finish — re-queue for evaluation
+            if ip.status == ItemStatus.COMPLETE:
+                await self.eval_queue.put(item)
+                continue
+
             # Check shutdown and cost limit before spawning
             if self.shutdown_requested:
                 break
@@ -85,6 +96,7 @@ class Orchestrator:
             # Mark item in_progress and save
             ip.status = ItemStatus.IN_PROGRESS
             await async_save_progress(self.progress, self.state_dir)
+            print(f"[{item.id}] executor starting: {item.description[:70]}", flush=True)
 
             # Emit item_status WebSocket event
             if self.ws is not None:
@@ -93,8 +105,9 @@ class Orchestrator:
             # Acquire file locks, run executor in try/finally
             await self.manager.acquire(item.files_affected, item.id)
             try:
+                _runner = run_refactor_executor if self.refactor_mode else run_executor
                 cost = await with_retry(
-                    lambda: run_executor(item, self.config, self.manager, self.state_dir, {}),
+                    lambda: _runner(item, self.config, self.manager, self.state_dir, {}),
                     label=item.id,
                 )
                 # Success path
@@ -105,8 +118,10 @@ class Orchestrator:
                 self.progress.totals.total_cost_usd += cost
                 self.progress.totals.total_executor_calls += 1
                 await async_save_progress(self.progress, self.state_dir)
+                print(f"[{item.id}] executor done (${cost:.4f})", flush=True)
                 await self.eval_queue.put(item)
-            except Exception:
+            except Exception as exc:
+                print(f"[{item.id}] executor error: {exc}", flush=True)
                 await self._defer_item(item, "agent_error")
             finally:
                 self.manager.release(item.files_affected, item.id)
@@ -123,7 +138,9 @@ class Orchestrator:
                 self.eval_queue.task_done()
                 break
 
-            verdict, eval_cost = await run_evaluator(item, self.config, self.state_dir)
+            print(f"[{item.id}] evaluating...", flush=True)
+            _eval_fn = run_refactor_evaluator if self.refactor_mode else run_evaluator
+            verdict, eval_cost = await _eval_fn(item, self.config, self.state_dir)
 
             ip = self.progress.items[item.id]
             ip.evaluator_cost_usd += eval_cost
@@ -135,6 +152,7 @@ class Orchestrator:
                 ip.eval = EvalResult.PASS
                 await async_save_progress(self.progress, self.state_dir)
                 await asyncio.to_thread(update_item_checkbox, Path(self.config.paths.plan), item.id, "x")
+                print(f"[{item.id}] PASS", flush=True)
                 if self.ws is not None:
                     asyncio.create_task(self.ws.broadcast({
                         "type": "eval_result",
@@ -145,6 +163,8 @@ class Orchestrator:
             else:
                 ip.eval = EvalResult.FAIL
                 await async_save_progress(self.progress, self.state_dir)
+                issue_summary = "; ".join(i.description for i in verdict.issues[:2])
+                print(f"[{item.id}] FAIL — {issue_summary}", flush=True)
                 if self.ws is not None:
                     asyncio.create_task(self.ws.broadcast({
                         "type": "eval_result",
@@ -165,6 +185,7 @@ class Orchestrator:
         """Run up to config.limits.max_fix_attempts fix+re-eval cycles; defer item if all fail."""
         async with self.fix_semaphore:
             for attempt in range(self.config.limits.max_fix_attempts):
+                print(f"[{item.id}] fix attempt {attempt + 1}/{self.config.limits.max_fix_attempts}", flush=True)
                 # 1. Emit fix_attempt WS event
                 if self.ws is not None:
                     asyncio.create_task(self.ws.broadcast({
@@ -194,7 +215,8 @@ class Orchestrator:
                     self.manager.release(item.files_affected, item.id)
 
                 # 5. Re-evaluate (outside the lock — evaluator is read-only)
-                verdict, eval_cost = await run_evaluator(item, self.config, self.state_dir)
+                _eval_fn = run_refactor_evaluator if self.refactor_mode else run_evaluator
+                verdict, eval_cost = await _eval_fn(item, self.config, self.state_dir)
                 ip = self.progress.items[item.id]
                 ip.evaluator_cost_usd += eval_cost
                 ip.total_cost_usd = ip.executor_cost_usd + ip.evaluator_cost_usd + ip.fix_cost_usd
@@ -209,6 +231,7 @@ class Orchestrator:
                     await asyncio.to_thread(
                         update_item_checkbox, Path(self.config.paths.plan), item.id, "x"
                     )
+                    print(f"[{item.id}] PASS after fix", flush=True)
                     if self.ws is not None:
                         asyncio.create_task(self.ws.broadcast({
                             "type": "eval_result",
@@ -233,6 +256,7 @@ class Orchestrator:
         # 1. Mutate item progress
         ip = self.progress.items[item.id]
         ip.status = ItemStatus.FLAGGED
+        print(f"[{item.id}] FLAGGED ({reason})", flush=True)
 
         # 2. Append FlaggedItem to flagged_for_review
         now = datetime.now(timezone.utc)
@@ -246,10 +270,19 @@ class Orchestrator:
         # 4. Save progress atomically
         await async_save_progress(self.progress, self.state_dir)
 
-        # 5. Write deferred_work.md entry (blocking I/O via to_thread)
+        # 5. Git-restore files on refactor failure so codebase is never left worse
+        if self.refactor_mode and item.files_affected:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["git", "checkout", "HEAD", "--"] + item.files_affected,
+                cwd=self.config.paths.project_root,
+                check=False,
+            )
+
+        # 6. Write deferred_work.md entry (blocking I/O via to_thread)
         await asyncio.to_thread(append_deferred_work, item, reason, resolved_issues, self.state_dir)
 
-        # 6. Emit WS events (guarded)
+        # 7. Emit WS events (guarded)
         if self.ws is not None:
             asyncio.create_task(self.ws.broadcast({
                 "type": "flagged",

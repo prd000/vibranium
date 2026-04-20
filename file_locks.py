@@ -38,6 +38,69 @@ class FileLockManager:
 
 
 WRITE_TOOLS: frozenset[str] = frozenset({"Write", "Edit", "MultiEdit"})
+READ_GUARD_TOOLS: frozenset[str] = frozenset({"Read", "Glob", "Grep", "Bash"})
+
+
+def make_test_guard_hook(tests_dir: Path) -> Any:
+    """Return an async hook callable that blocks executor access to the test directory.
+
+    The returned function matches the PreToolUse HookCallback signature:
+    async (input_data, tool_use_id, context) -> dict.
+
+    Blocks:
+    - Read: when file_path resolves under tests_dir
+    - Glob: when path resolves under tests_dir
+    - Grep: when path resolves under tests_dir
+    - Bash: when the command string contains the tests_dir absolute path
+    All other tools and all other paths are allowed through.
+    """
+    tests_dir_posix: str = tests_dir.resolve().as_posix()
+
+    async def hook(input_data: Any, tool_use_id: Any, context: Any) -> dict:
+        """Deny access to tests_dir; allow everything else."""
+        tool_name: str = input_data["tool_name"]
+        tool_input: dict = input_data.get("tool_input", {})
+
+        if tool_name == "Read":
+            file_path = tool_input.get("file_path", "")
+            if file_path:
+                resolved = Path(file_path).resolve().as_posix()
+                if resolved.startswith(tests_dir_posix):
+                    return {
+                        "type": "deny",
+                        "message": (
+                            "Access to the test directory is restricted to preserve test "
+                            "integrity. Implement based on the spec and acceptance criteria only."
+                        ),
+                    }
+
+        elif tool_name in {"Glob", "Grep"}:
+            path = tool_input.get("path", "") or ""
+            if path:
+                resolved = Path(path).resolve().as_posix()
+                if resolved.startswith(tests_dir_posix):
+                    return {
+                        "type": "deny",
+                        "message": (
+                            "Access to the test directory is restricted to preserve test "
+                            "integrity. Implement based on the spec and acceptance criteria only."
+                        ),
+                    }
+
+        elif tool_name == "Bash":
+            command = tool_input.get("command", "")
+            if tests_dir_posix in command:
+                return {
+                    "type": "deny",
+                    "message": (
+                        "Access to the test directory is restricted to preserve test "
+                        "integrity. Implement based on the spec and acceptance criteria only."
+                    ),
+                }
+
+        return {"type": "allow"}
+
+    return hook
 
 
 def make_pretooluse_hook(manager: FileLockManager, item_id: str) -> Any:
